@@ -1,0 +1,21 @@
+# Voice Memos Pipeline Configuration
+
+# Directory containing Apple Voice Memos .m4a files.
+# Terminal (or whichever app runs this) needs Full Disk Access:
+#   System Settings → Privacy & Security → Full Disk Access
+voice_memos_dir: "~/Library/Group Containers/group.com.apple.VoiceMemos.shared/Recordings"
+
+# Where to write Obsidian notes
+output_dir: "~/Documents/Obsidian/Meeting Notes"
+
+# Claude model used for transcript correction and note generation
+model: "claude-opus-4-7"
+
+# Minutes before/after recording time to search for calendar events
+time_window_minutes: 120
+
+# Seconds to wait for Apple's on-device transcription before giving up
+transcript_wait_seconds: 30
+
+# Set to false to skip Google Calendar lookup entirely
+use_claude_calendar: true
