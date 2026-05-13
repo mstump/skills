@@ -19,13 +19,19 @@ import anthropic
 import yaml
 
 CONFIG_FILE = Path(__file__).parent / "config.yaml"
+USER_CONFIG_FILE = Path("~/.config/skills/voice-memos.yaml").expanduser()
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
 def load_config() -> dict:
     with open(CONFIG_FILE) as f:
-        return yaml.safe_load(f)
+        config = yaml.safe_load(f)
+    if USER_CONFIG_FILE.exists():
+        with open(USER_CONFIG_FILE) as f:
+            overrides = yaml.safe_load(f) or {}
+        config.update(overrides)
+    return config
 
 
 # ── File metadata ─────────────────────────────────────────────────────────────

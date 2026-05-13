@@ -38,6 +38,14 @@ python3 process_memo.py /path/to/memo.m4a
 
 ## Configuration
 
+Settings are loaded from `config.yaml` in this directory, then overridden by `~/.config/skills/voice-memos.yaml` if it exists. Put personal settings (paths, model preference) in the user config so they survive repo updates.
+
+```yaml
+# ~/.config/skills/voice-memos.yaml
+output_dir: "~/Documents/Obsidian/Meeting Notes"
+model: "claude-opus-4-7"
+```
+
 | Key | Default | Description |
 |---|---|---|
 | `voice_memos_dir` | `~/Library/Group Containers/…/Recordings` | Where Voice Memos stores `.m4a` files |

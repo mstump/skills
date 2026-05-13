@@ -23,3 +23,8 @@ target
 # Secrets
 .env
 
+# Claude Code
+.claude/worktrees/
+.claude/jobs/
+.claude/settings.local.json
+
