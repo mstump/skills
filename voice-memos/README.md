@@ -22,7 +22,7 @@ new .m4a file
 
 Then:
 1. Set `output_dir` in `~/.config/skills/voice-memos.yaml`
-2. Grant **Full Disk Access** to `target/release/process_memo`:
+2. Grant **Full Disk Access** to `target/release/process-memo`:
    `System Settings → Privacy & Security → Full Disk Access`
 3. Ensure you are logged in to Claude Code (`claude`)
 
@@ -30,10 +30,10 @@ Then:
 
 ```bash
 # Watch for new memos continuously
-./target/release/process_memo watch
+./target/release/process-memo watch
 
 # Process a single memo
-./target/release/process_memo /path/to/memo.m4a
+./target/release/process-memo /path/to/memo.m4a
 ```
 
 ## Configuration
@@ -91,14 +91,14 @@ Full corrected transcript…
 
 ## Running as a Login Item (LaunchAgent)
 
-Running `process_memo watch` as a macOS LaunchAgent starts the pipeline automatically at login and keeps it alive in the background. In this mode there's no terminal, so the meeting-confirmation step uses an `osascript` dialog instead, and success/error events surface as macOS notifications.
+Running `process-memo watch` as a macOS LaunchAgent starts the pipeline automatically at login and keeps it alive in the background. In this mode there's no terminal, so the meeting-confirmation step uses an `osascript` dialog instead, and success/error events surface as macOS notifications.
 
 ### Full Disk Access
 
 Grant Full Disk Access to the binary:
 
 ```
-System Settings → Privacy & Security → Full Disk Access → click + → target/release/process_memo
+System Settings → Privacy & Security → Full Disk Access → click + → target/release/process-memo
 ```
 
 ### Install

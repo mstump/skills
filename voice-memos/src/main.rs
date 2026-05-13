@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Local, TimeZone};
+use clap::{Args, Parser, Subcommand};
 use is_terminal::IsTerminal;
 use notify::{EventKind, RecursiveMode, Watcher};
 use regex::Regex;
@@ -768,43 +769,64 @@ fn backfill(config: &Config, dir: &Path, dry_run: bool, keep: bool) -> Result<()
     Ok(())
 }
 
-fn main() -> Result<()> {
-    let raw_args: Vec<String> = std::env::args().collect();
-    let dry_run = raw_args.contains(&"--dry-run".to_string());
-    let keep = raw_args.contains(&"--keep".to_string());
-    let args: Vec<&str> = raw_args[1..]
-        .iter()
-        .filter(|a| *a != "--dry-run" && *a != "--keep")
-        .map(String::as_str)
-        .collect();
+#[derive(Args)]
+struct ProcessArgs {
+    /// Print the note to stdout instead of saving, and skip file deletion
+    #[arg(long)]
+    dry_run: bool,
+    /// Process without deleting the source memo file afterward
+    #[arg(long)]
+    keep: bool,
+}
 
+#[derive(Subcommand)]
+enum Cmd {
+    /// Watch for new Voice Memos and process them as they arrive
+    Watch,
+    /// Process all existing memos in the Voice Memos directory
+    Backfill {
+        #[command(flatten)]
+        args: ProcessArgs,
+    },
+    /// Process a single memo file
+    Run {
+        path: PathBuf,
+        #[command(flatten)]
+        args: ProcessArgs,
+    },
+    #[command(hide = true)]
+    PrintWatchDir,
+}
+
+#[derive(Parser)]
+#[command(name = "process-memo", about = "Voice Memos → Obsidian pipeline")]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
     let config = load_config()?;
 
-    match args.first().copied() {
-        Some("--print-watch-dir") => {
+    match cli.cmd {
+        Cmd::PrintWatchDir => {
             println!("{}", shellexpand::tilde(&config.voice_memos_dir));
         }
-        Some("watch") => {
+        Cmd::Watch => {
             let dir = check_voice_memos_access(&config);
             watch_loop(&config, &dir)?;
         }
-        Some("backfill") => {
+        Cmd::Backfill { args } => {
             let dir = check_voice_memos_access(&config);
-            backfill(&config, &dir, dry_run, keep)?;
+            backfill(&config, &dir, args.dry_run, args.keep)?;
         }
-        Some(path) => {
-            let memo_path = Path::new(path);
-            if !memo_path.exists() {
-                eprintln!("File not found: {}", memo_path.display());
+        Cmd::Run { path, args } => {
+            if !path.exists() {
+                eprintln!("File not found: {}", path.display());
                 std::process::exit(1);
             }
-            process_memo_file(memo_path, &config, dry_run, keep)?;
-        }
-        None => {
-            eprintln!("Usage: process_memo [--dry-run] [--keep] <path-to-memo.m4a>");
-            eprintln!("       process_memo [--dry-run] [--keep] backfill");
-            eprintln!("       process_memo watch");
-            std::process::exit(1);
+            process_memo_file(&path, &config, args.dry_run, args.keep)?;
         }
     }
 

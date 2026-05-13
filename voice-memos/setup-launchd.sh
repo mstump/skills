@@ -30,7 +30,7 @@ install() {
 
     <key>ProgramArguments</key>
     <array>
-        <string>$SCRIPT_DIR/target/release/process_memo</string>
+        <string>$SCRIPT_DIR/target/release/process-memo</string>
         <string>watch</string>
     </array>
 
