@@ -643,6 +643,10 @@ fn process_memo_file(memo_path: &Path, config: &Config) -> Result<()> {
         write_obsidian_note(&config.output_dir, &note_data, &file_time, Some(&meeting), &corrected)?;
     println!("\nSaved: {}\n", filepath.display());
 
+    if let Err(e) = std::fs::remove_file(memo_path) {
+        eprintln!("Warning: could not remove memo file: {e}");
+    }
+
     if !io::stdin().is_terminal() {
         notify(&format!(
             "Note saved: {}",
