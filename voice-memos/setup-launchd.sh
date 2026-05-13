@@ -30,8 +30,8 @@ install() {
 
     <key>ProgramArguments</key>
     <array>
-        <string>/bin/bash</string>
-        <string>$SCRIPT_DIR/watch.sh</string>
+        <string>$SCRIPT_DIR/target/release/process_memo</string>
+        <string>watch</string>
     </array>
 
     <!-- Start at login and restart automatically if it exits -->

@@ -21,19 +21,19 @@ new .m4a file
 ```
 
 Then:
-1. Edit `config.yaml` — set `output_dir` to your Obsidian vault path
-2. Grant **Full Disk Access** to Terminal.app:
+1. Set `output_dir` in `~/.config/skills/voice-memos.yaml`
+2. Grant **Full Disk Access** to `target/release/process_memo`:
    `System Settings → Privacy & Security → Full Disk Access`
-3. Ensure `ANTHROPIC_API_KEY` is set in your environment
+3. Ensure you are logged in to Claude Code (`claude`)
 
 ## Usage
 
 ```bash
 # Watch for new memos continuously
-./watch.sh
+./target/release/process_memo watch
 
 # Process a single memo
-python3 process_memo.py /path/to/memo.m4a
+./target/release/process_memo /path/to/memo.m4a
 ```
 
 ## Configuration
@@ -91,33 +91,24 @@ Full corrected transcript…
 
 ## Running as a Login Item (LaunchAgent)
 
-Running `watch.sh` as a macOS LaunchAgent starts the pipeline automatically at login and keeps it alive in the background. In this mode there's no terminal, so the meeting-confirmation step uses an `osascript` dialog instead, and success/error events surface as macOS notifications.
+Running `process_memo watch` as a macOS LaunchAgent starts the pipeline automatically at login and keeps it alive in the background. In this mode there's no terminal, so the meeting-confirmation step uses an `osascript` dialog instead, and success/error events surface as macOS notifications.
 
 ### Full Disk Access
 
-The LaunchAgent runs under your user account but is not a normal app bundle, so Full Disk Access must be granted to `/bin/bash` (the binary that runs `watch.sh`):
+Grant Full Disk Access to the binary:
 
 ```
-System Settings → Privacy & Security → Full Disk Access → click + → /bin/bash
+System Settings → Privacy & Security → Full Disk Access → click + → target/release/process_memo
 ```
-
-Alternatively grant it to the `watch.sh` script itself if macOS prompts for it.
 
 ### Install
 
-1. Copy `.env.example` to `.env` and fill in your API key:
-   ```bash
-   cp .env.example .env
-   # edit .env — set ANTHROPIC_API_KEY=sk-ant-...
-   ```
+```bash
+chmod +x setup-launchd.sh
+./setup-launchd.sh install
+```
 
-2. Run the install script:
-   ```bash
-   chmod +x setup-launchd.sh
-   ./setup-launchd.sh install
-   ```
-
-   This writes a plist to `~/Library/LaunchAgents/com.mstump.voice-memos-pipeline.plist` and loads it immediately — no reboot required.
+This writes a plist to `~/Library/LaunchAgents/com.mstump.voice-memos-pipeline.plist` and loads it immediately — no reboot required.
 
 ### Manage
 
@@ -131,12 +122,6 @@ Alternatively grant it to the `watch.sh` script itself if macOS prompts for it.
 tail -f ~/Library/Logs/voice-memos-pipeline.log
 ```
 
-### Uninstall
-
-```bash
-./setup-launchd.sh uninstall
-```
-
 ### How headless mode differs from terminal mode
 
 | | Terminal | LaunchAgent (headless) |
@@ -147,7 +132,7 @@ tail -f ~/Library/Logs/voice-memos-pipeline.log
 
 ## Troubleshooting
 
-**Transcript not found** — Terminal needs Full Disk Access. Without it, `mdls` cannot read Voice Memos metadata. See Setup step 2.
+**Transcript not found** — The binary needs Full Disk Access. Without it, `mdls` cannot read Voice Memos metadata. See Setup step 2.
 
 **No calendar events found** — Check that `claude` CLI is in your PATH and the Google Calendar MCP is authenticated. You can set `use_claude_calendar: false` and enter meeting details manually.
 
