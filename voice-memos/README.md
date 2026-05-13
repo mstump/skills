@@ -33,8 +33,16 @@ Then:
 ./target/release/process-memo watch
 
 # Process a single memo
-./target/release/process-memo /path/to/memo.m4a
+./target/release/process-memo run /path/to/memo.m4a
+
+# Process all existing memos
+./target/release/process-memo backfill
+
+# Backfill without deleting source files, print notes to stdout
+./target/release/process-memo backfill --keep --dry-run
 ```
+
+Set `RUST_LOG=debug` for verbose output (transcript content, claude CLI details).
 
 ## Configuration
 
@@ -127,8 +135,8 @@ tail -f ~/Library/Logs/voice-memos-pipeline.log
 | | Terminal | LaunchAgent (headless) |
 |---|---|---|
 | Meeting confirmation | Text prompt in terminal | `osascript` dialog box |
-| No transcript found | Prompts to paste manually | macOS notification, then skips |
-| Note saved | Prints path to stdout | macOS notification |
+| No transcript found | Logs warning, skips | macOS notification, then skips |
+| Note saved | Logs path | macOS notification |
 
 ## Troubleshooting
 
