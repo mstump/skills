@@ -510,26 +510,13 @@ fn confirm_meeting(
 
 // ── Obsidian output ───────────────────────────────────────────────────────────
 
-fn write_obsidian_note(
-    output_dir: &str,
+fn build_note_markdown(
     note_data: &NoteData,
     file_time: &DateTime<Local>,
     meeting: Option<&Meeting>,
     transcript: &str,
-) -> Result<PathBuf> {
-    let out = PathBuf::from(shellexpand::tilde(output_dir).as_ref());
-    std::fs::create_dir_all(&out)?;
-
+) -> Result<String> {
     let title = &note_data.title;
-    let safe_title: String = title
-        .chars()
-        .filter(|c| !r#"<>:"/\|?*"#.contains(*c))
-        .take(60)
-        .collect::<String>()
-        .trim()
-        .to_string();
-    let filepath = out.join(format!("{} {}.md", file_time.format("%Y-%m-%d"), safe_title));
-
     let mut lines = vec!["---".to_string()];
     lines.push(format!("title: {}", serde_json::to_string(title)?));
     lines.push(format!("date: {}", file_time.format("%Y-%m-%d")));
@@ -542,16 +529,10 @@ fn write_obsidian_note(
     if let Some(m) = meeting {
         lines.push(format!("meeting: {}", serde_json::to_string(&m.title)?));
         if !m.start_time.is_empty() {
-            lines.push(format!(
-                "meeting_start: {}",
-                serde_json::to_string(&m.start_time)?
-            ));
+            lines.push(format!("meeting_start: {}", serde_json::to_string(&m.start_time)?));
         }
         if !m.end_time.is_empty() {
-            lines.push(format!(
-                "meeting_end: {}",
-                serde_json::to_string(&m.end_time)?
-            ));
+            lines.push(format!("meeting_end: {}", serde_json::to_string(&m.end_time)?));
         }
         if !m.attendees.is_empty() {
             lines.push("attendees:".to_string());
@@ -575,15 +556,37 @@ fn write_obsidian_note(
     body.push_str("\n\n## Transcript\n\n");
     body.push_str(transcript.trim());
     body.push('\n');
+    Ok(body)
+}
 
+fn write_obsidian_note(
+    output_dir: &str,
+    note_data: &NoteData,
+    file_time: &DateTime<Local>,
+    meeting: Option<&Meeting>,
+    transcript: &str,
+) -> Result<PathBuf> {
+    let out = PathBuf::from(shellexpand::tilde(output_dir).as_ref());
+    std::fs::create_dir_all(&out)?;
+
+    let safe_title: String = note_data.title
+        .chars()
+        .filter(|c| !r#"<>:"/\|?*"#.contains(*c))
+        .take(60)
+        .collect::<String>()
+        .trim()
+        .to_string();
+    let filepath = out.join(format!("{} {}.md", file_time.format("%Y-%m-%d"), safe_title));
+    let body = build_note_markdown(note_data, file_time, meeting, transcript)?;
     std::fs::write(&filepath, body)?;
     Ok(filepath)
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
-fn process_memo_file(memo_path: &Path, config: &Config) -> Result<()> {
-    println!("\nProcessing: {}", memo_path.file_name().unwrap_or_default().to_string_lossy());
+fn process_memo_file(memo_path: &Path, config: &Config, dry_run: bool, keep: bool) -> Result<()> {
+    let prefix = if dry_run { "[dry-run] " } else { "" };
+    println!("\n{prefix}Processing: {}", memo_path.file_name().unwrap_or_default().to_string_lossy());
 
     let file_time = get_file_creation_time(memo_path);
     println!("Recorded:  {}", file_time.format("%Y-%m-%d %H:%M:%S"));
@@ -600,10 +603,12 @@ fn process_memo_file(memo_path: &Path, config: &Config) -> Result<()> {
         None => {
             println!("not found.");
             if !io::stdin().is_terminal() {
-                notify(&format!(
-                    "Could not extract transcript from {}. Check Full Disk Access.",
-                    memo_path.file_name().unwrap_or_default().to_string_lossy()
-                ));
+                if !dry_run {
+                    notify(&format!(
+                        "Could not extract transcript from {}. Check Full Disk Access.",
+                        memo_path.file_name().unwrap_or_default().to_string_lossy()
+                    ));
+                }
                 return Ok(());
             }
             println!(
@@ -639,12 +644,22 @@ fn process_memo_file(memo_path: &Path, config: &Config) -> Result<()> {
     let note_data = generate_note_content(&corrected, Some(&meeting), &file_time, config)?;
     println!("done");
 
+    if dry_run {
+        let note = build_note_markdown(&note_data, &file_time, Some(&meeting), &corrected)?;
+        println!("\n{}\n", "─".repeat(62));
+        print!("{note}");
+        println!("{}\n", "─".repeat(62));
+        return Ok(());
+    }
+
     let filepath =
         write_obsidian_note(&config.output_dir, &note_data, &file_time, Some(&meeting), &corrected)?;
     println!("\nSaved: {}\n", filepath.display());
 
-    if let Err(e) = std::fs::remove_file(memo_path) {
-        eprintln!("Warning: could not remove memo file: {e}");
+    if !keep {
+        if let Err(e) = std::fs::remove_file(memo_path) {
+            eprintln!("Warning: could not remove memo file: {e}");
+        }
     }
 
     if !io::stdin().is_terminal() {
@@ -716,7 +731,7 @@ fn watch_loop(config: &Config) -> Result<()> {
             );
             // Small delay — let the file finish writing and Apple start transcribing
             thread::sleep(Duration::from_secs(3));
-            if let Err(e) = process_memo_file(&path, config) {
+            if let Err(e) = process_memo_file(&path, config, false, false) {
                 eprintln!("Error processing {}: {e}", path.display());
             }
         }
@@ -725,7 +740,7 @@ fn watch_loop(config: &Config) -> Result<()> {
     Ok(())
 }
 
-fn backfill(config: &Config) -> Result<()> {
+fn backfill(config: &Config, dry_run: bool, keep: bool) -> Result<()> {
     let dir = PathBuf::from(shellexpand::tilde(&config.voice_memos_dir).as_ref());
 
     if !dir.exists() {
@@ -755,7 +770,7 @@ fn backfill(config: &Config) -> Result<()> {
 
     let mut errors = 0usize;
     for memo in &memos {
-        if let Err(e) = process_memo_file(memo, config) {
+        if let Err(e) = process_memo_file(memo, config, dry_run, keep) {
             eprintln!("Error processing {}: {e}", memo.display());
             errors += 1;
         }
@@ -771,12 +786,20 @@ fn backfill(config: &Config) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().collect();
+    let raw_args: Vec<String> = std::env::args().collect();
+    let dry_run = raw_args.contains(&"--dry-run".to_string());
+    let keep = raw_args.contains(&"--keep".to_string());
+    let args: Vec<&str> = raw_args[1..]
+        .iter()
+        .filter(|a| *a != "--dry-run" && *a != "--keep")
+        .map(String::as_str)
+        .collect();
+
     let config = load_config()?;
 
-    match args.get(1).map(String::as_str) {
+    match args.first().copied() {
         Some("watch") => watch_loop(&config)?,
-        Some("backfill") => backfill(&config)?,
+        Some("backfill") => backfill(&config, dry_run, keep)?,
         Some("--print-watch-dir") => {
             println!("{}", shellexpand::tilde(&config.voice_memos_dir));
         }
@@ -786,12 +809,12 @@ fn main() -> Result<()> {
                 eprintln!("File not found: {}", memo_path.display());
                 std::process::exit(1);
             }
-            process_memo_file(memo_path, &config)?;
+            process_memo_file(memo_path, &config, dry_run, keep)?;
         }
         None => {
-            eprintln!("Usage: process_memo <path-to-memo.m4a>");
+            eprintln!("Usage: process_memo [--dry-run] [--keep] <path-to-memo.m4a>");
+            eprintln!("       process_memo [--dry-run] [--keep] backfill");
             eprintln!("       process_memo watch");
-            eprintln!("       process_memo backfill");
             std::process::exit(1);
         }
     }
