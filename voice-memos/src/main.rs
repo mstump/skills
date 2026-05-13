@@ -1,8 +1,10 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Local, TimeZone};
 use is_terminal::IsTerminal;
+use notify::{EventKind, RecursiveMode, Watcher};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -580,27 +582,7 @@ fn write_obsidian_note(
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
-fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-
-    if args.get(1).map(String::as_str) == Some("--print-watch-dir") {
-        let config = load_config()?;
-        println!("{}", shellexpand::tilde(&config.voice_memos_dir));
-        return Ok(());
-    }
-
-    if args.len() < 2 {
-        eprintln!("Usage: process_memo <path-to-memo.m4a>");
-        std::process::exit(1);
-    }
-
-    let memo_path = Path::new(&args[1]);
-    if !memo_path.exists() {
-        eprintln!("File not found: {}", memo_path.display());
-        std::process::exit(1);
-    }
-
-    let config = load_config()?;
+fn process_memo_file(memo_path: &Path, config: &Config) -> Result<()> {
     println!("\nProcessing: {}", memo_path.file_name().unwrap_or_default().to_string_lossy());
 
     let file_time = get_file_creation_time(memo_path);
@@ -608,7 +590,7 @@ fn main() -> Result<()> {
 
     print!("Extracting transcript… ");
     io::stdout().flush()?;
-    let transcript = get_transcript(memo_path, &config);
+    let transcript = get_transcript(memo_path, config);
 
     let transcript = match transcript {
         Some(t) => {
@@ -639,12 +621,12 @@ fn main() -> Result<()> {
 
     print!("Correcting transcript with Claude… ");
     io::stdout().flush()?;
-    let corrected = correct_transcript(&transcript, &config)?;
+    let corrected = correct_transcript(&transcript, config)?;
     println!("done");
 
     print!("Querying Google Calendar… ");
     io::stdout().flush()?;
-    let meetings = find_meetings(&file_time, &config);
+    let meetings = find_meetings(&file_time, config);
     println!("{} event(s) found", meetings.len());
 
     let Some(meeting) = confirm_meeting(memo_path, &file_time, meetings, &corrected) else {
@@ -654,7 +636,7 @@ fn main() -> Result<()> {
 
     print!("\nGenerating summary… ");
     io::stdout().flush()?;
-    let note_data = generate_note_content(&corrected, Some(&meeting), &file_time, &config)?;
+    let note_data = generate_note_content(&corrected, Some(&meeting), &file_time, config)?;
     println!("done");
 
     let filepath =
@@ -666,6 +648,101 @@ fn main() -> Result<()> {
             "Note saved: {}",
             filepath.file_name().unwrap_or_default().to_string_lossy()
         ));
+    }
+
+    Ok(())
+}
+
+fn watch_loop(config: &Config) -> Result<()> {
+    let watch_dir = shellexpand::tilde(&config.voice_memos_dir).into_owned();
+    let watch_path = PathBuf::from(&watch_dir);
+
+    if !watch_path.exists() {
+        eprintln!(
+            "Error: directory not accessible: {}\n\n\
+            Terminal needs Full Disk Access to read Voice Memos:\n  \
+            System Settings → Privacy & Security → Full Disk Access → add Terminal",
+            watch_path.display()
+        );
+        std::process::exit(1);
+    }
+
+    println!("Watching: {}", watch_path.display());
+    println!("Press Ctrl+C to stop.\n");
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut watcher = notify::recommended_watcher(move |res| {
+        tx.send(res).ok();
+    })?;
+    watcher.watch(&watch_path, RecursiveMode::NonRecursive)?;
+
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+
+    for res in &rx {
+        let event = match res {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("Watch error: {e}");
+                continue;
+            }
+        };
+
+        let is_new = matches!(
+            event.kind,
+            EventKind::Create(_)
+                | EventKind::Modify(notify::event::ModifyKind::Name(
+                    notify::event::RenameMode::To
+                ))
+        );
+        if !is_new {
+            continue;
+        }
+
+        for path in event.paths {
+            if path.extension().and_then(|e| e.to_str()) != Some("m4a") {
+                continue;
+            }
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+            println!(
+                "[{}] New memo: {}",
+                Local::now().format("%H:%M:%S"),
+                path.file_name().unwrap_or_default().to_string_lossy()
+            );
+            // Small delay — let the file finish writing and Apple start transcribing
+            thread::sleep(Duration::from_secs(3));
+            if let Err(e) = process_memo_file(&path, config) {
+                eprintln!("Error processing {}: {e}", path.display());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    let config = load_config()?;
+
+    match args.get(1).map(String::as_str) {
+        Some("watch") => watch_loop(&config)?,
+        Some("--print-watch-dir") => {
+            println!("{}", shellexpand::tilde(&config.voice_memos_dir));
+        }
+        Some(path) => {
+            let memo_path = Path::new(path);
+            if !memo_path.exists() {
+                eprintln!("File not found: {memo_path}", memo_path = memo_path.display());
+                std::process::exit(1);
+            }
+            process_memo_file(memo_path, &config)?;
+        }
+        None => {
+            eprintln!("Usage: process_memo <path-to-memo.m4a>");
+            eprintln!("       process_memo watch");
+            std::process::exit(1);
+        }
     }
 
     Ok(())
