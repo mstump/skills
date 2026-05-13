@@ -137,34 +137,31 @@ fn find_atom<'a>(data: &'a [u8], target: &[u8; 4]) -> Option<&'a [u8]> {
     None
 }
 
-fn extract_via_m4a_atoms(path: &Path) -> Option<String> {
+fn extract_via_tsrp(path: &Path) -> Option<String> {
     let data = std::fs::read(path).ok()?;
-    // ©trn is latin-1 0xA9 followed by "trn"
-    const TARGETS: &[[u8; 4]] = &[
-        *b"tran",
-        [0xa9, b't', b'r', b'n'],
-        *b"trns",
-        *b"tdsc",
-    ];
-    for target in TARGETS {
-        if let Some(payload) = find_atom(&data, target) {
-            let text = String::from_utf8_lossy(payload)
-                .trim_matches('\0')
-                .trim()
-                .to_string();
-            if text.len() > 20 {
-                return Some(text);
-            }
-        }
-    }
-    None
+    let payload = find_atom(&data, b"tsrp")?;
+    let json: serde_json::Value = serde_json::from_slice(payload).ok()?;
+    let attributed = json.get("attributedString")?;
+
+    let text: String = if let Some(arr) = attributed.as_array() {
+        // format 1: ["word", {"timeRange": [...]}, "word", ...]
+        arr.iter().filter_map(|v| v.as_str()).collect()
+    } else if let Some(runs) = attributed.get("runs").and_then(|r| r.as_array()) {
+        // format 2: {"runs": ["word", 0, "word", 1, ...]}
+        runs.iter().filter_map(|v| v.as_str()).collect()
+    } else {
+        return None;
+    };
+
+    let text = text.trim().to_string();
+    if text.len() > 5 { Some(text) } else { None }
 }
 
 fn get_transcript(path: &Path, config: &Config) -> Option<String> {
     let attempts = 3u32;
     let delay = Duration::from_secs((config.transcript_wait_seconds / attempts as u64).max(1));
     for attempt in 0..attempts {
-        let t = extract_via_mdls(path).or_else(|| extract_via_m4a_atoms(path));
+        let t = extract_via_tsrp(path).or_else(|| extract_via_mdls(path));
         if t.is_some() {
             return t;
         }
