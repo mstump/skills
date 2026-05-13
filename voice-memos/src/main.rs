@@ -725,19 +725,65 @@ fn watch_loop(config: &Config) -> Result<()> {
     Ok(())
 }
 
+fn backfill(config: &Config) -> Result<()> {
+    let dir = PathBuf::from(shellexpand::tilde(&config.voice_memos_dir).as_ref());
+
+    if !dir.exists() {
+        eprintln!(
+            "Error: directory not accessible: {}\n\n\
+            Binary needs Full Disk Access to read Voice Memos:\n  \
+            System Settings → Privacy & Security → Full Disk Access",
+            dir.display()
+        );
+        std::process::exit(1);
+    }
+
+    let mut memos: Vec<PathBuf> = std::fs::read_dir(&dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("m4a"))
+        .collect();
+
+    memos.sort();
+
+    if memos.is_empty() {
+        println!("No .m4a files found in {}", dir.display());
+        return Ok(());
+    }
+
+    println!("Found {} memo(s) to process.\n", memos.len());
+
+    let mut errors = 0usize;
+    for memo in &memos {
+        if let Err(e) = process_memo_file(memo, config) {
+            eprintln!("Error processing {}: {e}", memo.display());
+            errors += 1;
+        }
+    }
+
+    println!(
+        "\nBackfill complete: {}/{} processed successfully.",
+        memos.len() - errors,
+        memos.len()
+    );
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let config = load_config()?;
 
     match args.get(1).map(String::as_str) {
         Some("watch") => watch_loop(&config)?,
+        Some("backfill") => backfill(&config)?,
         Some("--print-watch-dir") => {
             println!("{}", shellexpand::tilde(&config.voice_memos_dir));
         }
         Some(path) => {
             let memo_path = Path::new(path);
             if !memo_path.exists() {
-                eprintln!("File not found: {memo_path}", memo_path = memo_path.display());
+                eprintln!("File not found: {}", memo_path.display());
                 std::process::exit(1);
             }
             process_memo_file(memo_path, &config)?;
@@ -745,6 +791,7 @@ fn main() -> Result<()> {
         None => {
             eprintln!("Usage: process_memo <path-to-memo.m4a>");
             eprintln!("       process_memo watch");
+            eprintln!("       process_memo backfill");
             std::process::exit(1);
         }
     }
