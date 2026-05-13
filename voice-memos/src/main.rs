@@ -176,29 +176,38 @@ fn get_transcript(path: &Path, config: &Config) -> Option<String> {
 
 // ── Claude API ────────────────────────────────────────────────────────────────
 
-fn call_claude(model: &str, max_tokens: u32, prompt: &str) -> Result<String> {
-    let api_key = std::env::var("ANTHROPIC_API_KEY").context("ANTHROPIC_API_KEY not set")?;
-    let body = serde_json::json!({
-        "model": model,
-        "max_tokens": max_tokens,
-        "messages": [{"role": "user", "content": prompt}],
-    });
-    let resp = ureq::post("https://api.anthropic.com/v1/messages")
-        .set("x-api-key", &api_key)
-        .set("anthropic-version", "2023-06-01")
-        .send_json(body)
-        .context("Anthropic API request failed")?;
-    let json: serde_json::Value = resp.into_json().context("parsing API response")?;
-    json["content"][0]["text"]
-        .as_str()
-        .map(|s| s.trim().to_string())
-        .ok_or_else(|| anyhow!("unexpected API response shape: {json}"))
+fn call_claude(model: &str, prompt: &str) -> Result<String> {
+    let mut child = Command::new("claude")
+        .args(["-p", prompt, "--model", model])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("claude CLI not found — install Claude Code from https://claude.ai/code")?;
+
+    let deadline = Instant::now() + Duration::from_secs(180);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                return Err(anyhow!("claude CLI timed out after 180s"));
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(200)),
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("claude CLI failed: {stderr}"));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 fn correct_transcript(raw: &str, config: &Config) -> Result<String> {
     call_claude(
         &config.model,
-        8192,
         &format!(
             "Fix grammar, punctuation, capitalization, and obvious speech-to-text \
             errors in this transcript. Preserve the speaker's words and meaning. \
@@ -243,7 +252,7 @@ fn generate_note_content(
         file_time.format("%Y-%m-%d %H:%M")
     );
 
-    let raw = call_claude(&config.model, 2048, &prompt)?;
+    let raw = call_claude(&config.model, &prompt)?;
     let re = Regex::new(r"(?s)^```(?:json)?\s*|\s*```$").unwrap();
     let cleaned = re.replace_all(raw.trim(), "").trim().to_string();
     serde_json::from_str(&cleaned).with_context(|| format!("parsing note JSON:\n{cleaned}"))
