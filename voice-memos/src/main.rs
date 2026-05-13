@@ -601,26 +601,14 @@ fn process_memo_file(memo_path: &Path, config: &Config, dry_run: bool, keep: boo
             t
         }
         None => {
-            println!("not found.");
-            if !io::stdin().is_terminal() {
-                if !dry_run {
-                    notify(&format!(
-                        "Could not extract transcript from {}. Check Full Disk Access.",
-                        memo_path.file_name().unwrap_or_default().to_string_lossy()
-                    ));
-                }
-                return Ok(());
+            println!("not found — skipping.");
+            if !dry_run && !io::stdin().is_terminal() {
+                notify(&format!(
+                    "No transcript found in {}.",
+                    memo_path.file_name().unwrap_or_default().to_string_lossy()
+                ));
             }
-            println!(
-                "\nCould not extract transcript automatically.\n\
-                Tip: grant Full Disk Access to Terminal in\n\
-                     System Settings → Privacy & Security → Full Disk Access\n"
-            );
-            let manual = prompt_line("Paste transcript manually (or Enter to skip): ");
-            if manual.is_empty() {
-                return Ok(());
-            }
-            manual
+            return Ok(());
         }
     };
 
@@ -672,20 +660,7 @@ fn process_memo_file(memo_path: &Path, config: &Config, dry_run: bool, keep: boo
     Ok(())
 }
 
-fn watch_loop(config: &Config) -> Result<()> {
-    let watch_dir = shellexpand::tilde(&config.voice_memos_dir).into_owned();
-    let watch_path = PathBuf::from(&watch_dir);
-
-    if !watch_path.exists() {
-        eprintln!(
-            "Error: directory not accessible: {}\n\n\
-            Terminal needs Full Disk Access to read Voice Memos:\n  \
-            System Settings → Privacy & Security → Full Disk Access → add Terminal",
-            watch_path.display()
-        );
-        std::process::exit(1);
-    }
-
+fn watch_loop(config: &Config, watch_path: &Path) -> Result<()> {
     println!("Watching: {}", watch_path.display());
     println!("Press Ctrl+C to stop.\n");
 
@@ -693,7 +668,7 @@ fn watch_loop(config: &Config) -> Result<()> {
     let mut watcher = notify::recommended_watcher(move |res| {
         tx.send(res).ok();
     })?;
-    watcher.watch(&watch_path, RecursiveMode::NonRecursive)?;
+    watcher.watch(watch_path, RecursiveMode::NonRecursive)?;
 
     let mut seen: HashSet<PathBuf> = HashSet::new();
 
@@ -740,20 +715,31 @@ fn watch_loop(config: &Config) -> Result<()> {
     Ok(())
 }
 
-fn backfill(config: &Config, dry_run: bool, keep: bool) -> Result<()> {
+fn check_voice_memos_access(config: &Config) -> PathBuf {
     let dir = PathBuf::from(shellexpand::tilde(&config.voice_memos_dir).as_ref());
-
-    if !dir.exists() {
-        eprintln!(
-            "Error: directory not accessible: {}\n\n\
-            Binary needs Full Disk Access to read Voice Memos:\n  \
-            System Settings → Privacy & Security → Full Disk Access",
-            dir.display()
-        );
-        std::process::exit(1);
+    match std::fs::read_dir(&dir) {
+        Ok(entries) => {
+            let count = entries
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("m4a"))
+                .count();
+            println!("Voice Memos: {} ({count} memo(s))", dir.display());
+        }
+        Err(e) => {
+            eprintln!(
+                "Error: cannot access {}: {e}\n\n\
+                Grant Full Disk Access to this binary:\n  \
+                System Settings → Privacy & Security → Full Disk Access",
+                dir.display()
+            );
+            std::process::exit(1);
+        }
     }
+    dir
+}
 
-    let mut memos: Vec<PathBuf> = std::fs::read_dir(&dir)?
+fn backfill(config: &Config, dir: &Path, dry_run: bool, keep: bool) -> Result<()> {
+    let mut memos: Vec<PathBuf> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("m4a"))
@@ -762,11 +748,11 @@ fn backfill(config: &Config, dry_run: bool, keep: bool) -> Result<()> {
     memos.sort();
 
     if memos.is_empty() {
-        println!("No .m4a files found in {}", dir.display());
+        println!("No memos to process.");
         return Ok(());
     }
 
-    println!("Found {} memo(s) to process.\n", memos.len());
+    println!("Processing {} memo(s)…\n", memos.len());
 
     let mut errors = 0usize;
     for memo in &memos {
@@ -798,10 +784,16 @@ fn main() -> Result<()> {
     let config = load_config()?;
 
     match args.first().copied() {
-        Some("watch") => watch_loop(&config)?,
-        Some("backfill") => backfill(&config, dry_run, keep)?,
         Some("--print-watch-dir") => {
             println!("{}", shellexpand::tilde(&config.voice_memos_dir));
+        }
+        Some("watch") => {
+            let dir = check_voice_memos_access(&config);
+            watch_loop(&config, &dir)?;
+        }
+        Some("backfill") => {
+            let dir = check_voice_memos_access(&config);
+            backfill(&config, &dir, dry_run, keep)?;
         }
         Some(path) => {
             let memo_path = Path::new(path);
