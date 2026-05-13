@@ -6,11 +6,12 @@ use notify::{EventKind, RecursiveMode, Watcher};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
+use tracing::{debug, error, info, warn};
 
 const DEFAULT_CONFIG: &str = include_str!("../config.yaml");
 const USER_CONFIG_SUBPATH: &str = ".config/skills/voice-memos.yaml";
@@ -167,7 +168,7 @@ fn get_transcript(path: &Path, config: &Config) -> Option<String> {
             return t;
         }
         if attempt < attempts - 1 {
-            println!("  waiting for transcript ({}/{})…", attempt + 1, attempts - 1);
+            info!(attempt = attempt + 1, of = attempts - 1, "waiting for transcript");
             thread::sleep(delay);
         }
     }
@@ -177,6 +178,7 @@ fn get_transcript(path: &Path, config: &Config) -> Option<String> {
 // ── Claude API ────────────────────────────────────────────────────────────────
 
 fn call_claude(model: &str, prompt: &str) -> Result<String> {
+    debug!(model, prompt_chars = prompt.len(), "calling claude CLI");
     let mut child = Command::new("claude")
         .args(["-p", prompt, "--model", model])
         .stdout(Stdio::piped())
@@ -184,12 +186,28 @@ fn call_claude(model: &str, prompt: &str) -> Result<String> {
         .spawn()
         .context("claude CLI not found — install Claude Code from https://claude.ai/code")?;
 
+    // Drain stdout/stderr on separate threads to avoid pipe-buffer deadlock when
+    // the subprocess writes more than the OS buffer (typically 64 KB) before exiting.
+    let mut child_stdout = child.stdout.take().unwrap();
+    let mut child_stderr = child.stderr.take().unwrap();
+    let stdout_thread = thread::spawn(move || {
+        let mut buf = String::new();
+        child_stdout.read_to_string(&mut buf).ok();
+        buf
+    });
+    let stderr_thread = thread::spawn(move || {
+        let mut buf = String::new();
+        child_stderr.read_to_string(&mut buf).ok();
+        buf
+    });
+
     let deadline = Instant::now() + Duration::from_secs(180);
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
             Ok(None) if Instant::now() >= deadline => {
                 let _ = child.kill();
+                let _ = child.wait();
                 return Err(anyhow!("claude CLI timed out after 180s"));
             }
             Ok(None) => thread::sleep(Duration::from_millis(200)),
@@ -197,12 +215,26 @@ fn call_claude(model: &str, prompt: &str) -> Result<String> {
         }
     }
 
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("claude CLI failed: {stderr}"));
+    let status = child.wait()?;
+    let stdout_str = stdout_thread.join().unwrap_or_default();
+    let stderr_str = stderr_thread.join().unwrap_or_default();
+
+    if !status.success() {
+        let code = status.code().unwrap_or(-1);
+        let detail = if !stderr_str.trim().is_empty() {
+            stderr_str.trim().to_string()
+        } else if !stdout_str.trim().is_empty() {
+            stdout_str.trim().to_string()
+        } else {
+            format!("exit code {code}, no output")
+        };
+        debug!(%detail, "claude CLI stderr: {}", stderr_str.trim());
+        return Err(anyhow!("claude CLI failed (exit {code}): {detail}"));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+
+    let result = stdout_str.trim().to_string();
+    debug!(response_chars = result.len(), "claude CLI responded");
+    Ok(result)
 }
 
 fn correct_transcript(raw: &str, config: &Config) -> Result<String> {
@@ -304,7 +336,7 @@ fn find_meetings(file_time: &DateTime<Local>, config: &Config) -> Vec<Meeting> {
     {
         Ok(c) => c,
         Err(_) => {
-            println!("  (claude CLI not found — skipping calendar lookup)");
+            warn!("claude CLI not found, skipping calendar lookup");
             return vec![];
         }
     };
@@ -583,23 +615,24 @@ fn write_obsidian_note(
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn process_memo_file(memo_path: &Path, config: &Config, dry_run: bool, keep: bool) -> Result<()> {
-    let prefix = if dry_run { "[dry-run] " } else { "" };
-    println!("\n{prefix}Processing: {}", memo_path.file_name().unwrap_or_default().to_string_lossy());
+    info!(path = %memo_path.display(), dry_run, "processing");
 
     let file_time = get_file_creation_time(memo_path);
-    println!("Recorded:  {}", file_time.format("%Y-%m-%d %H:%M:%S"));
+    info!(recorded = %file_time.format("%Y-%m-%d %H:%M:%S"), "file timestamp");
 
-    print!("Extracting transcript… ");
-    io::stdout().flush()?;
+    info!("extracting transcript");
     let transcript = get_transcript(memo_path, config);
 
     let transcript = match transcript {
         Some(t) => {
-            println!("ok ({} chars)", t.len());
+            info!(chars = t.len(), "transcript extracted");
+            if t.len() < 50 {
+                debug!(content = %t, "short transcript content");
+            }
             t
         }
         None => {
-            println!("not found — skipping.");
+            warn!(path = %memo_path.display(), "no transcript found, skipping");
             if !dry_run && !io::stdin().is_terminal() {
                 notify(&format!(
                     "No transcript found in {}.",
@@ -610,25 +643,22 @@ fn process_memo_file(memo_path: &Path, config: &Config, dry_run: bool, keep: boo
         }
     };
 
-    print!("Correcting transcript with Claude… ");
-    io::stdout().flush()?;
+    info!("correcting transcript");
     let corrected = correct_transcript(&transcript, config)?;
-    println!("done");
+    info!(chars = corrected.len(), "transcript corrected");
 
-    print!("Querying Google Calendar… ");
-    io::stdout().flush()?;
+    info!("querying google calendar");
     let meetings = find_meetings(&file_time, config);
-    println!("{} event(s) found", meetings.len());
+    info!(events = meetings.len(), "calendar queried");
 
     let Some(meeting) = confirm_meeting(memo_path, &file_time, meetings, &corrected) else {
-        println!("Skipped.");
+        info!("skipped by user");
         return Ok(());
     };
 
-    print!("\nGenerating summary… ");
-    io::stdout().flush()?;
+    info!("generating summary");
     let note_data = generate_note_content(&corrected, Some(&meeting), &file_time, config)?;
-    println!("done");
+    info!("summary generated");
 
     if dry_run {
         let note = build_note_markdown(&note_data, &file_time, Some(&meeting), &corrected)?;
@@ -640,11 +670,11 @@ fn process_memo_file(memo_path: &Path, config: &Config, dry_run: bool, keep: boo
 
     let filepath =
         write_obsidian_note(&config.output_dir, &note_data, &file_time, Some(&meeting), &corrected)?;
-    println!("\nSaved: {}\n", filepath.display());
+    info!(path = %filepath.display(), "note saved");
 
     if !keep {
         if let Err(e) = std::fs::remove_file(memo_path) {
-            eprintln!("Warning: could not remove memo file: {e}");
+            warn!("could not remove memo file: {e}");
         }
     }
 
@@ -659,8 +689,7 @@ fn process_memo_file(memo_path: &Path, config: &Config, dry_run: bool, keep: boo
 }
 
 fn watch_loop(config: &Config, watch_path: &Path) -> Result<()> {
-    println!("Watching: {}", watch_path.display());
-    println!("Press Ctrl+C to stop.\n");
+    info!(path = %watch_path.display(), "watching for new memos, press ctrl-c to stop");
 
     let (tx, rx) = std::sync::mpsc::channel();
     let mut watcher = notify::recommended_watcher(move |res| {
@@ -674,7 +703,7 @@ fn watch_loop(config: &Config, watch_path: &Path) -> Result<()> {
         let event = match res {
             Ok(e) => e,
             Err(e) => {
-                eprintln!("Watch error: {e}");
+                error!("watch error: {e}");
                 continue;
             }
         };
@@ -697,15 +726,11 @@ fn watch_loop(config: &Config, watch_path: &Path) -> Result<()> {
             if !seen.insert(path.clone()) {
                 continue;
             }
-            println!(
-                "[{}] New memo: {}",
-                Local::now().format("%H:%M:%S"),
-                path.file_name().unwrap_or_default().to_string_lossy()
-            );
+            info!(path = %path.display(), "new memo detected");
             // Small delay — let the file finish writing and Apple start transcribing
             thread::sleep(Duration::from_secs(3));
             if let Err(e) = process_memo_file(&path, config, false, false) {
-                eprintln!("Error processing {}: {e}", path.display());
+                error!(path = %path.display(), error = %e, "processing failed");
             }
         }
     }
@@ -721,14 +746,13 @@ fn check_voice_memos_access(config: &Config) -> PathBuf {
                 .filter_map(|e| e.ok())
                 .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("m4a"))
                 .count();
-            println!("Voice Memos: {} ({count} memo(s))", dir.display());
+            info!(path = %dir.display(), memos = count, "voice memos accessible");
         }
         Err(e) => {
-            eprintln!(
-                "Error: cannot access {}: {e}\n\n\
-                Grant Full Disk Access to this binary:\n  \
-                System Settings → Privacy & Security → Full Disk Access",
-                dir.display()
+            error!(
+                path = %dir.display(),
+                error = %e,
+                "cannot access voice memos — grant Full Disk Access in System Settings → Privacy & Security → Full Disk Access"
             );
             std::process::exit(1);
         }
@@ -746,24 +770,24 @@ fn backfill(config: &Config, dir: &Path, dry_run: bool, keep: bool) -> Result<()
     memos.sort();
 
     if memos.is_empty() {
-        println!("No memos to process.");
+        info!("no memos to process");
         return Ok(());
     }
 
-    println!("Processing {} memo(s)…\n", memos.len());
+    info!(count = memos.len(), "starting backfill");
 
     let mut errors = 0usize;
     for memo in &memos {
         if let Err(e) = process_memo_file(memo, config, dry_run, keep) {
-            eprintln!("Error processing {}: {e}", memo.display());
+            error!(path = %memo.display(), error = %e, "processing failed");
             errors += 1;
         }
     }
 
-    println!(
-        "\nBackfill complete: {}/{} processed successfully.",
-        memos.len() - errors,
-        memos.len()
+    info!(
+        processed = memos.len() - errors,
+        total = memos.len(),
+        "backfill complete"
     );
 
     Ok(())
@@ -806,6 +830,13 @@ struct Cli {
 }
 
 fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
     let cli = Cli::parse();
     let config = load_config()?;
 
@@ -823,7 +854,7 @@ fn main() -> Result<()> {
         }
         Cmd::Run { path, args } => {
             if !path.exists() {
-                eprintln!("File not found: {}", path.display());
+                error!(path = %path.display(), "file not found");
                 std::process::exit(1);
             }
             process_memo_file(&path, &config, args.dry_run, args.keep)?;
