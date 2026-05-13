@@ -12,16 +12,17 @@ if [[ -f "$SCRIPT_DIR/.env" ]]; then
     set +a
 fi
 
-VOICE_MEMOS_DIR=$(python3 - <<'EOF'
-import yaml, os, sys
-with open(sys.argv[1]) as f:
-    c = yaml.safe_load(f)
-print(os.path.expanduser(c.get("voice_memos_dir", "")))
-EOF
-"$SCRIPT_DIR/config.yaml")
+BINARY="$SCRIPT_DIR/target/release/process_memo"
+
+if [[ ! -x "$BINARY" ]]; then
+    echo "Error: binary not found — run ./setup.sh first" >&2
+    exit 1
+fi
+
+VOICE_MEMOS_DIR=$("$BINARY" --print-watch-dir 2>&1)
 
 if [[ -z "$VOICE_MEMOS_DIR" ]]; then
-    echo "Error: voice_memos_dir not configured in config.yaml" >&2
+    echo "Error: voice_memos_dir not configured" >&2
     exit 1
 fi
 
@@ -42,7 +43,7 @@ fswatch -0 --event Created "$VOICE_MEMOS_DIR" | while IFS= read -r -d '' file; d
         echo "[$(date '+%H:%M:%S')] New memo: $(basename "$file")"
         # Small delay — let the file finish writing and Apple start transcribing
         sleep 3
-        python3 "$SCRIPT_DIR/process_memo.py" "$file" || {
+        "$BINARY" "$file" || {
             echo "Error processing $file" >&2
         }
     fi
