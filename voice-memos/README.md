@@ -4,14 +4,23 @@ Watches Apple Voice Memos for new recordings, extracts the transcript, corrects 
 
 ## Pipeline
 
+**Interactive** (invoked via `/voice-memos` Claude skill):
+```
+pending .m4a files
+    → extract Apple transcript (m4a atom / mdls)
+    → correct transcript with Claude
+    → find nearby Google Calendar events (±30 min, via claude MCP)
+    → score each event against transcript content with Claude
+    → present candidates + recommendation in Claude session
+    → user confirms or selects → write Obsidian note → delete source
+```
+
+**Non-interactive** (watch daemon / backfill --auto):
 ```
 new .m4a file
-    → extract Apple transcript (mdls / m4a atom parsing)
-    → correct transcript with Claude
-    → find nearby Google Calendar events (via claude CLI + MCP)
-    → confirm meeting + attendees with user
-    → generate title, summary, tags with Claude
-    → write Obsidian note with YAML frontmatter
+    → same extraction + correction + calendar + scoring
+    → auto-select best match (score ≥ 50, else no meeting metadata)
+    → write Obsidian note → delete source → macOS notification
 ```
 
 ## Setup
@@ -28,21 +37,34 @@ Then:
 
 ## Usage
 
+**Interactive (Claude skill)** — run `/voice-memos` in a Claude Code session. Claude handles meeting selection in the conversation.
+
+**Daemon / batch:**
 ```bash
-# Watch for new memos continuously
+# Watch for new memos and auto-process (run as LaunchAgent)
 ./target/release/process-memo watch
+
+# Process all existing memos with auto-selection
+./target/release/process-memo backfill --auto
+
+# Auto-backfill without deleting source files
+./target/release/process-memo backfill --auto --keep
 
 # Process a single memo
 ./target/release/process-memo run /path/to/memo.m4a
-
-# Process all existing memos
-./target/release/process-memo backfill
-
-# Backfill without deleting source files, print notes to stdout
-./target/release/process-memo backfill --keep --dry-run
 ```
 
-Set `RUST_LOG=debug` for verbose output (transcript content, claude CLI details).
+**Low-level commands** (used internally by the skill):
+```bash
+# Prepare a memo: extract + correct + score → JSON to stdout
+./target/release/process-memo prepare /path/to/memo.m4a > prepared.json
+
+# Finalize with a chosen meeting (0-based index) or no meeting
+./target/release/process-memo finalize prepared.json --select 0
+./target/release/process-memo finalize prepared.json          # no meeting
+```
+
+Set `RUST_LOG=debug` for verbose output (transcript content, Claude CLI details).
 
 ## Configuration
 
@@ -59,7 +81,7 @@ model: "claude-opus-4-7"
 | `voice_memos_dir` | `~/Library/Group Containers/…/Recordings` | Where Voice Memos stores `.m4a` files |
 | `output_dir` | `~/Documents/Obsidian/Meeting Notes` | Where to write Obsidian notes |
 | `model` | `claude-opus-4-7` | Claude model for transcript correction and summarization |
-| `time_window_minutes` | `120` | Minutes before recording time to search for calendar events |
+| `time_window_minutes` | `30` | Minutes ± recording time to search for calendar events |
 | `transcript_wait_seconds` | `30` | How long to wait for Apple's on-device transcription before giving up |
 | `use_claude_calendar` | `true` | Set to `false` to skip Google Calendar lookup |
 

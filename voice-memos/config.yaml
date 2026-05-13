@@ -11,8 +11,8 @@ output_dir: "~/Documents/Obsidian/Meeting Notes"
 # Claude model used for transcript correction and note generation
 model: "claude-opus-4-7"
 
-# Minutes before/after recording time to search for calendar events
-time_window_minutes: 120
+# Minutes before AND after recording time to search for calendar events (±window)
+time_window_minutes: 30
 
 # Seconds to wait for Apple's on-device transcription before giving up
 transcript_wait_seconds: 30

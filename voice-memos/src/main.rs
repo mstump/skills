@@ -6,7 +6,7 @@ use notify::{EventKind, RecursiveMode, Watcher};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -311,14 +311,16 @@ fn find_meetings(file_time: &DateTime<Local>, config: &Config) -> Vec<Meeting> {
         return vec![];
     }
 
-    let start = (*file_time - chrono::Duration::minutes(config.time_window_minutes))
+    let window = config.time_window_minutes;
+    let start = (*file_time - chrono::Duration::minutes(window))
         .format("%Y-%m-%dT%H:%M:%S");
-    let end = (*file_time + chrono::Duration::minutes(30)).format("%Y-%m-%dT%H:%M:%S");
+    let end = (*file_time + chrono::Duration::minutes(window))
+        .format("%Y-%m-%dT%H:%M:%S");
 
     let prompt = format!(
         "Using Google Calendar, list events between {start} and {end} in local time. \
         Return a JSON array only — no prose. Each element: \
-        {{\"title\": \"...\", \"start_time\": \"...\", \"end_time\": \"...\", \
+        {{\"title\": \"...\", \"start_time\": \"ISO8601\", \"end_time\": \"ISO8601\", \
         \"attendees\": [\"name or email\", ...], \"description\": \"...\"}}. \
         If no events found, return []."
     );
@@ -366,7 +368,235 @@ fn find_meetings(file_time: &DateTime<Local>, config: &Config) -> Vec<Meeting> {
         .unwrap_or_default()
 }
 
-// ── User confirmation ─────────────────────────────────────────────────────────
+// ── Meeting scoring ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ScoredMeeting {
+    #[serde(flatten)]
+    meeting: Meeting,
+    duration_minutes: Option<i64>,
+    relevance_score: u8,
+    relevance_reason: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PreparedMemo {
+    memo_path: String,
+    recorded: String,
+    transcript: String,
+    meetings: Vec<ScoredMeeting>,
+    recommended_index: Option<usize>,
+}
+
+impl PreparedMemo {
+    fn recorded_dt(&self) -> Result<DateTime<Local>> {
+        chrono::DateTime::parse_from_rfc3339(&self.recorded)
+            .map(|dt| dt.with_timezone(&Local))
+            .context("parsing recorded timestamp")
+    }
+}
+
+fn compute_duration_minutes(start: &str, end: &str) -> Option<i64> {
+    // Try ISO 8601 full datetime first
+    if let (Ok(s), Ok(e)) = (
+        chrono::DateTime::parse_from_rfc3339(start),
+        chrono::DateTime::parse_from_rfc3339(end),
+    ) {
+        let diff = (e - s).num_minutes();
+        return Some(diff.abs());
+    }
+
+    // Try HH:MM or HH:MM:SS
+    let parse_hhmm = |s: &str| -> Option<i64> {
+        let s = s.trim();
+        let mut parts = s.splitn(3, ':');
+        let h: i64 = parts.next()?.trim().parse().ok()?;
+        let m: i64 = parts.next()?.trim().parse().ok()?;
+        Some(h * 60 + m)
+    };
+
+    let sm = parse_hhmm(start)?;
+    let em = parse_hhmm(end)?;
+    let diff = em - sm;
+    Some(if diff >= 0 { diff } else { diff + 24 * 60 })
+}
+
+fn score_meetings(
+    transcript: &str,
+    meetings: &[Meeting],
+    file_time: &DateTime<Local>,
+    config: &Config,
+) -> Vec<ScoredMeeting> {
+    if meetings.is_empty() {
+        return vec![];
+    }
+
+    let meeting_list = meetings
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let dur = compute_duration_minutes(&m.start_time, &m.end_time);
+            let dur_str = dur.map(|d| format!(" ({d} min)")).unwrap_or_default();
+            let att = if m.attendees.is_empty() {
+                "(none)".to_string()
+            } else {
+                m.attendees.join(", ")
+            };
+            let desc = m.description.as_deref().unwrap_or("(none)");
+            format!(
+                "[{i}] {}{} | {} – {}{dur_str}\n    Attendees: {att}\n    Description: {desc}",
+                m.title,
+                if m.title.is_empty() { "(no title)" } else { "" },
+                m.start_time,
+                m.end_time,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    let preview: String = transcript.chars().take(600).collect();
+    let ellipsis = if transcript.chars().count() > 600 { "…" } else { "" };
+
+    let prompt = format!(
+        "Match this voice memo to its most likely Google Calendar event.\n\
+        Recording time: {}\n\n\
+        Transcript excerpt:\n{preview}{ellipsis}\n\n\
+        Nearby calendar events:\n{meeting_list}\n\n\
+        Score each event 0–100 for how likely this transcript was recorded during it.\n\
+        Consider: timing overlap, names/topics in the transcript vs event title/description/attendees.\n\
+        Return ONLY valid JSON array: \
+        [{{\"index\":0,\"score\":85,\"reason\":\"one sentence\"}},...]",
+        file_time.format("%Y-%m-%d %H:%M")
+    );
+
+    let scores: Vec<serde_json::Value> = match call_claude(&config.model, &prompt) {
+        Ok(raw) => {
+            let re = Regex::new(r"(?s)\[.*\]").unwrap();
+            re.find(&raw)
+                .and_then(|m| serde_json::from_str(m.as_str()).ok())
+                .unwrap_or_default()
+        }
+        Err(e) => {
+            warn!("meeting scoring failed: {e}");
+            vec![]
+        }
+    };
+
+    meetings
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let entry = scores
+                .iter()
+                .find(|s| s.get("index").and_then(|v| v.as_u64()) == Some(i as u64));
+            let (relevance_score, relevance_reason) = entry
+                .map(|s| {
+                    (
+                        s.get("score").and_then(|v| v.as_u64()).unwrap_or(0) as u8,
+                        s.get("reason")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    )
+                })
+                .unwrap_or((0, String::new()));
+
+            ScoredMeeting {
+                duration_minutes: compute_duration_minutes(&m.start_time, &m.end_time),
+                meeting: m.clone(),
+                relevance_score,
+                relevance_reason,
+            }
+        })
+        .collect()
+}
+
+fn prepare_memo(path: &Path, config: &Config) -> Result<PreparedMemo> {
+    info!(path = %path.display(), "preparing memo");
+
+    let file_time = get_file_creation_time(path);
+    info!(recorded = %file_time.format("%Y-%m-%d %H:%M:%S"), "file timestamp");
+
+    info!("extracting transcript");
+    let raw = get_transcript(path, config);
+    let raw = match raw {
+        Some(t) => {
+            info!(chars = t.len(), "transcript extracted");
+            if t.len() < 50 {
+                debug!(content = %t, "short transcript content");
+            }
+            t
+        }
+        None => {
+            return Err(anyhow!("no transcript found"));
+        }
+    };
+
+    info!("correcting transcript");
+    let transcript = correct_transcript(&raw, config)?;
+    info!(chars = transcript.len(), "transcript corrected");
+
+    info!("finding meetings (±{} min)", config.time_window_minutes);
+    let meetings = find_meetings(&file_time, config);
+    info!(count = meetings.len(), "meetings found");
+
+    let scored = if meetings.is_empty() {
+        vec![]
+    } else {
+        info!("scoring meeting relevance");
+        let s = score_meetings(&transcript, &meetings, &file_time, config);
+        info!("scoring complete");
+        s
+    };
+
+    let recommended_index = scored
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, m)| m.relevance_score)
+        .map(|(i, _)| i);
+
+    Ok(PreparedMemo {
+        memo_path: path.to_string_lossy().to_string(),
+        recorded: file_time.to_rfc3339(),
+        transcript,
+        meetings: scored,
+        recommended_index,
+    })
+}
+
+fn finalize_memo(
+    prepared: &PreparedMemo,
+    select: Option<usize>,
+    keep: bool,
+    config: &Config,
+) -> Result<PathBuf> {
+    let file_time = prepared.recorded_dt()?;
+    let meeting = select
+        .and_then(|i| prepared.meetings.get(i))
+        .map(|sm| &sm.meeting);
+
+    info!("generating note");
+    let note_data = generate_note_content(&prepared.transcript, meeting, &file_time, config)?;
+
+    let filepath = write_obsidian_note(
+        &config.output_dir,
+        &note_data,
+        &file_time,
+        meeting,
+        &prepared.transcript,
+    )?;
+    info!(path = %filepath.display(), "note saved");
+
+    if !keep {
+        if let Err(e) = std::fs::remove_file(&prepared.memo_path) {
+            warn!("could not remove memo file: {e}");
+        }
+    }
+
+    Ok(filepath)
+}
+
+// ── macOS notifications ───────────────────────────────────────────────────────
 
 fn osascript(script: &str) -> String {
     Command::new("osascript")
@@ -381,161 +611,6 @@ fn notify(message: &str) {
     osascript(&format!(
         "display notification \"{safe}\" with title \"Voice Memos Pipeline\""
     ));
-}
-
-fn escape_as(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-fn confirm_meeting_gui(file_time: &DateTime<Local>, meetings: &[Meeting]) -> Option<Meeting> {
-    let time_str = file_time.format("%Y-%m-%d %H:%M").to_string();
-
-    if meetings.is_empty() {
-        let result = osascript(&format!(
-            "display dialog \"Voice Memo recorded at {time_str}\\n\\n\
-            No calendar events found nearby. Continue without meeting metadata?\" \
-            buttons {{\"Skip\", \"Continue\"}} default button \"Continue\""
-        ));
-        if result.contains("Skip") || result.is_empty() {
-            return None;
-        }
-        return Some(Meeting {
-            title: format!("Recording {time_str}"),
-            ..Default::default()
-        });
-    }
-
-    let options: Vec<String> = meetings
-        .iter()
-        .map(|m| {
-            let start = if m.start_time.len() >= 5 {
-                &m.start_time[..5]
-            } else {
-                &m.start_time
-            };
-            format!("{} ({start})", m.title)
-        })
-        .collect();
-
-    let skip = "None of these / skip";
-    let as_list = options
-        .iter()
-        .map(|o| format!("\"{}\"", escape_as(o)))
-        .chain(std::iter::once(format!("\"{skip}\"")))
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    let result = osascript(&format!(
-        "choose from list {{{as_list}}} \
-        with prompt \"Voice Memo — {time_str}\\nWhich meeting does this belong to?\" \
-        default items {{\"{}\"}}",
-        escape_as(&options[0])
-    ));
-
-    if result.is_empty() || result == "false" || result == skip {
-        return None;
-    }
-
-    options
-        .iter()
-        .position(|o| o == &result)
-        .and_then(|i| meetings.get(i))
-        .cloned()
-}
-
-fn prompt_line(p: &str) -> String {
-    print!("{p}");
-    io::stdout().flush().ok();
-    let mut line = String::new();
-    io::stdin().read_line(&mut line).ok();
-    line.trim().to_string()
-}
-
-fn confirm_meeting(
-    memo_path: &Path,
-    file_time: &DateTime<Local>,
-    meetings: Vec<Meeting>,
-    transcript: &str,
-) -> Option<Meeting> {
-    if !io::stdin().is_terminal() {
-        return confirm_meeting_gui(file_time, &meetings);
-    }
-
-    let sep = "─".repeat(62);
-    println!(
-        "\n{sep}\nMemo:     {}\nRecorded: {}",
-        memo_path.file_name().unwrap_or_default().to_string_lossy(),
-        file_time.format("%Y-%m-%d %H:%M:%S"),
-    );
-    let preview: String = transcript.chars().take(200).collect();
-    let ellipsis = if transcript.chars().count() > 200 { "…" } else { "" };
-    println!("Preview:  {}{ellipsis}", preview.replace('\n', " "));
-
-    if meetings.is_empty() {
-        println!("\nNo matching calendar events found.");
-    } else {
-        println!("\n{} calendar event(s) found nearby:", meetings.len());
-        for (i, m) in meetings.iter().enumerate() {
-            let att = &m.attendees;
-            let mut att_str = att.iter().take(4).cloned().collect::<Vec<_>>().join(", ");
-            if att.len() > 4 {
-                att_str.push_str(&format!(" +{} more", att.len() - 4));
-            }
-            println!("\n  [{}] {}", i + 1, m.title);
-            println!("       {} – {}", m.start_time, m.end_time);
-            if !att_str.is_empty() {
-                println!("       {att_str}");
-            }
-        }
-    }
-
-    let n = meetings.len();
-    println!("\n  [{}] Enter meeting details manually", n + 1);
-    println!("  [0] Skip");
-    println!("{sep}");
-
-    let choice = loop {
-        let raw = prompt_line(&format!("Select [0–{}]: ", n + 1));
-        if let Ok(c) = raw.parse::<usize>() {
-            if c <= n + 1 {
-                break c;
-            }
-        }
-    };
-
-    if choice == 0 {
-        return None;
-    }
-    if choice <= n {
-        return Some(meetings[choice - 1].clone());
-    }
-
-    let title = prompt_line("Meeting title: ");
-    let title = if title.is_empty() {
-        format!("Meeting {}", file_time.format("%Y-%m-%d %H:%M"))
-    } else {
-        title
-    };
-    let att_raw = prompt_line("Attendees (comma-separated, or blank): ");
-    let attendees = att_raw
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    let default_start = file_time.format("%H:%M").to_string();
-    let start_raw = prompt_line(&format!("Start time (default {default_start}): "));
-    let start_time = if start_raw.is_empty() {
-        default_start
-    } else {
-        start_raw
-    };
-
-    Some(Meeting {
-        title,
-        attendees,
-        start_time,
-        ..Default::default()
-    })
 }
 
 // ── Obsidian output ───────────────────────────────────────────────────────────
@@ -612,71 +687,44 @@ fn write_obsidian_note(
     Ok(filepath)
 }
 
-// ── Entry point ───────────────────────────────────────────────────────────────
+// ── Pipeline ──────────────────────────────────────────────────────────────────
 
+/// Full auto-select pipeline for a single file (watch mode, backfill --auto, run).
+/// Selects the highest-scoring meeting above the 50-point threshold; saves without
+/// meeting metadata if nothing clears the bar.
 fn process_memo_file(memo_path: &Path, config: &Config, dry_run: bool, keep: bool) -> Result<()> {
-    info!(path = %memo_path.display(), dry_run, "processing");
+    let prepared = prepare_memo(memo_path, config)?;
 
-    let file_time = get_file_creation_time(memo_path);
-    info!(recorded = %file_time.format("%Y-%m-%d %H:%M:%S"), "file timestamp");
+    let select = prepared.recommended_index.filter(|&i| {
+        prepared
+            .meetings
+            .get(i)
+            .map(|m| m.relevance_score >= 50)
+            .unwrap_or(false)
+    });
 
-    info!("extracting transcript");
-    let transcript = get_transcript(memo_path, config);
-
-    let transcript = match transcript {
-        Some(t) => {
-            info!(chars = t.len(), "transcript extracted");
-            if t.len() < 50 {
-                debug!(content = %t, "short transcript content");
-            }
-            t
+    if let Some(i) = select {
+        if let Some(m) = prepared.meetings.get(i) {
+            info!(
+                meeting = %m.meeting.title,
+                score = m.relevance_score,
+                "auto-selected meeting"
+            );
         }
-        None => {
-            warn!(path = %memo_path.display(), "no transcript found, skipping");
-            if !dry_run && !io::stdin().is_terminal() {
-                notify(&format!(
-                    "No transcript found in {}.",
-                    memo_path.file_name().unwrap_or_default().to_string_lossy()
-                ));
-            }
-            return Ok(());
-        }
-    };
-
-    info!("correcting transcript");
-    let corrected = correct_transcript(&transcript, config)?;
-    info!(chars = corrected.len(), "transcript corrected");
-
-    info!("querying google calendar");
-    let meetings = find_meetings(&file_time, config);
-    info!(events = meetings.len(), "calendar queried");
-
-    let Some(meeting) = confirm_meeting(memo_path, &file_time, meetings, &corrected) else {
-        info!("skipped by user");
-        return Ok(());
-    };
-
-    info!("generating summary");
-    let note_data = generate_note_content(&corrected, Some(&meeting), &file_time, config)?;
-    info!("summary generated");
+    } else {
+        info!("no meeting matched threshold, saving without meeting metadata");
+    }
 
     if dry_run {
-        let note = build_note_markdown(&note_data, &file_time, Some(&meeting), &corrected)?;
-        println!("\n{}\n", "─".repeat(62));
-        print!("{note}");
-        println!("{}\n", "─".repeat(62));
+        let file_time = prepared.recorded_dt()?;
+        let meeting = select.and_then(|i| prepared.meetings.get(i)).map(|sm| &sm.meeting);
+        let note_data = generate_note_content(&prepared.transcript, meeting, &file_time, config)?;
+        let note = build_note_markdown(&note_data, &file_time, meeting, &prepared.transcript)?;
+        println!("{note}");
         return Ok(());
     }
 
-    let filepath =
-        write_obsidian_note(&config.output_dir, &note_data, &file_time, Some(&meeting), &corrected)?;
-    info!(path = %filepath.display(), "note saved");
-
-    if !keep {
-        if let Err(e) = std::fs::remove_file(memo_path) {
-            warn!("could not remove memo file: {e}");
-        }
-    }
+    let filepath = finalize_memo(&prepared, select, keep, config)?;
 
     if !io::stdin().is_terminal() {
         notify(&format!(
@@ -731,6 +779,12 @@ fn watch_loop(config: &Config, watch_path: &Path) -> Result<()> {
             thread::sleep(Duration::from_secs(3));
             if let Err(e) = process_memo_file(&path, config, false, false) {
                 error!(path = %path.display(), error = %e, "processing failed");
+                if !io::stdin().is_terminal() {
+                    notify(&format!(
+                        "Failed: {}",
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    ));
+                }
             }
         }
     }
@@ -760,13 +814,42 @@ fn check_voice_memos_access(config: &Config) -> PathBuf {
     dir
 }
 
-fn backfill(config: &Config, dir: &Path, dry_run: bool, keep: bool) -> Result<()> {
+/// Prepare-only backfill: runs prepare_memo for each file and writes one JSON
+/// object per line to stdout (NDJSON). Used by the interactive skill command.
+fn backfill_prepare(config: &Config, dir: &Path) -> Result<()> {
     let mut memos: Vec<PathBuf> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("m4a"))
         .collect();
+    memos.sort();
 
+    if memos.is_empty() {
+        info!("no memos found");
+        return Ok(());
+    }
+
+    info!(count = memos.len(), "preparing memos");
+    for memo in &memos {
+        match prepare_memo(memo, config) {
+            Ok(prepared) => {
+                println!("{}", serde_json::to_string(&prepared)?);
+            }
+            Err(e) => {
+                error!(path = %memo.display(), error = %e, "prepare failed");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Auto-select backfill: full pipeline with no user interaction.
+fn backfill_auto(config: &Config, dir: &Path, dry_run: bool, keep: bool) -> Result<()> {
+    let mut memos: Vec<PathBuf> = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("m4a"))
+        .collect();
     memos.sort();
 
     if memos.is_empty() {
@@ -793,6 +876,8 @@ fn backfill(config: &Config, dir: &Path, dry_run: bool, keep: bool) -> Result<()
     Ok(())
 }
 
+// ── CLI ───────────────────────────────────────────────────────────────────────
+
 #[derive(Args)]
 struct ProcessArgs {
     /// Print the note to stdout instead of saving, and skip file deletion
@@ -805,19 +890,42 @@ struct ProcessArgs {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Watch for new Voice Memos and process them as they arrive
+    /// Watch for new Voice Memos and auto-process them as they arrive
     Watch,
-    /// Process all existing memos in the Voice Memos directory
+
+    /// Process all existing memos; without --auto outputs NDJSON for the skill to consume
     Backfill {
+        /// Automatically select best meeting match and write notes (daemon/batch mode)
+        #[arg(long)]
+        auto: bool,
         #[command(flatten)]
         args: ProcessArgs,
     },
-    /// Process a single memo file
+
+    /// Process a single memo file with auto-selected meeting
     Run {
         path: PathBuf,
         #[command(flatten)]
         args: ProcessArgs,
     },
+
+    /// Extract transcript, correct it, and score nearby meetings; outputs JSON
+    Prepare {
+        path: PathBuf,
+    },
+
+    /// Write an Obsidian note from a prepared JSON file with a chosen meeting
+    Finalize {
+        /// Path to the JSON file produced by `prepare`
+        prepared_json: PathBuf,
+        /// Index of meeting to use (0-based from the meetings array); omit for no meeting
+        #[arg(long)]
+        select: Option<usize>,
+        /// Keep the source memo file (do not delete)
+        #[arg(long)]
+        keep: bool,
+    },
+
     #[command(hide = true)]
     PrintWatchDir,
 }
@@ -844,20 +952,45 @@ fn main() -> Result<()> {
         Cmd::PrintWatchDir => {
             println!("{}", shellexpand::tilde(&config.voice_memos_dir));
         }
+
         Cmd::Watch => {
             let dir = check_voice_memos_access(&config);
             watch_loop(&config, &dir)?;
         }
-        Cmd::Backfill { args } => {
+
+        Cmd::Backfill { auto, args } => {
             let dir = check_voice_memos_access(&config);
-            backfill(&config, &dir, args.dry_run, args.keep)?;
+            if auto {
+                backfill_auto(&config, &dir, args.dry_run, args.keep)?;
+            } else {
+                backfill_prepare(&config, &dir)?;
+            }
         }
+
         Cmd::Run { path, args } => {
             if !path.exists() {
                 error!(path = %path.display(), "file not found");
                 std::process::exit(1);
             }
             process_memo_file(&path, &config, args.dry_run, args.keep)?;
+        }
+
+        Cmd::Prepare { path } => {
+            if !path.exists() {
+                error!(path = %path.display(), "file not found");
+                std::process::exit(1);
+            }
+            let prepared = prepare_memo(&path, &config)?;
+            println!("{}", serde_json::to_string(&prepared)?);
+        }
+
+        Cmd::Finalize { prepared_json, select, keep } => {
+            let content = std::fs::read_to_string(&prepared_json)
+                .with_context(|| format!("reading {}", prepared_json.display()))?;
+            let prepared: PreparedMemo = serde_json::from_str(&content)
+                .context("parsing prepared JSON")?;
+            let filepath = finalize_memo(&prepared, select, keep, &config)?;
+            println!("{}", filepath.display());
         }
     }
 
