@@ -5,7 +5,8 @@ Watches Apple Voice Memos for new recordings, extracts the transcript, corrects 
 ## Pipeline
 
 **Interactive** (invoked via `/voice-memos` Claude skill):
-```
+
+```plain
 pending .m4a files
     → extract Apple transcript (m4a atom / mdls)
     → correct transcript with Claude
@@ -16,7 +17,8 @@ pending .m4a files
 ```
 
 **Non-interactive** (watch daemon / backfill --auto):
-```
+
+```plain
 new .m4a file
     → same extraction + correction + calendar + scoring
     → auto-select best match (score ≥ 50, else no meeting metadata)
@@ -30,6 +32,7 @@ new .m4a file
 ```
 
 Then:
+
 1. Set `output_dir` in `~/.config/skills/voice-memos.yaml`
 2. Grant **Full Disk Access** to `target/release/process-memo`:
    `System Settings → Privacy & Security → Full Disk Access`
@@ -40,6 +43,7 @@ Then:
 **Interactive (Claude skill)** — run `/voice-memos` in a Claude Code session. Claude handles meeting selection in the conversation.
 
 **Daemon / batch:**
+
 ```bash
 # Watch for new memos and auto-process (run as LaunchAgent)
 ./target/release/process-memo watch
@@ -55,6 +59,7 @@ Then:
 ```
 
 **Low-level commands** (used internally by the skill):
+
 ```bash
 # Prepare a memo: extract + correct + score → JSON to stdout
 ./target/release/process-memo prepare /path/to/memo.m4a > prepared.json
@@ -76,14 +81,14 @@ output_dir: "~/Documents/Obsidian/Meeting Notes"
 model: "claude-opus-4-7"
 ```
 
-| Key | Default | Description |
-|---|---|---|
-| `voice_memos_dir` | `~/Library/Group Containers/…/Recordings` | Where Voice Memos stores `.m4a` files |
-| `output_dir` | `~/Documents/Obsidian/Meeting Notes` | Where to write Obsidian notes |
-| `model` | `claude-opus-4-7` | Claude model for transcript correction and summarization |
-| `time_window_minutes` | `30` | Minutes ± recording time to search for calendar events |
-| `transcript_wait_seconds` | `30` | How long to wait for Apple's on-device transcription before giving up |
-| `use_claude_calendar` | `true` | Set to `false` to skip Google Calendar lookup |
+| Key                       | Default                                   | Description                                                           |
+|---------------------------|-------------------------------------------|-----------------------------------------------------------------------|
+| `voice_memos_dir`         | `~/Library/Group Containers/…/Recordings` | Where Voice Memos stores `.m4a` files                                 |
+| `output_dir`              | `~/Documents/Obsidian/Meeting Notes`      | Where to write Obsidian notes                                         |
+| `model`                   | `claude-opus-4-7`                         | Claude model for transcript correction and summarization              |
+| `time_window_minutes`     | `30`                                      | Minutes ± recording time to search for calendar events                |
+| `transcript_wait_seconds` | `30`                                      | How long to wait for Apple's on-device transcription before giving up |
+| `use_claude_calendar`     | `true`                                    | Set to `false` to skip Google Calendar lookup                         |
 
 ## Output format
 
@@ -127,7 +132,7 @@ Running `process-memo watch` as a macOS LaunchAgent starts the pipeline automati
 
 Grant Full Disk Access to the binary:
 
-```
+```plain
 System Settings → Privacy & Security → Full Disk Access → click + → target/release/process-memo
 ```
 
@@ -154,11 +159,11 @@ tail -f ~/Library/Logs/voice-memos-pipeline.log
 
 ### How headless mode differs from terminal mode
 
-| | Terminal | LaunchAgent (headless) |
-|---|---|---|
-| Meeting confirmation | Text prompt in terminal | `osascript` dialog box |
-| No transcript found | Logs warning, skips | macOS notification, then skips |
-| Note saved | Logs path | macOS notification |
+|                      | Terminal                | LaunchAgent (headless)         |
+|----------------------|-------------------------|--------------------------------|
+| Meeting confirmation | Text prompt in terminal | `osascript` dialog box         |
+| No transcript found  | Logs warning, skips     | macOS notification, then skips |
+| Note saved           | Logs path               | macOS notification             |
 
 ## Troubleshooting
 
