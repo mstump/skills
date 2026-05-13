@@ -81,6 +81,62 @@ tags:
 Full corrected transcript…
 ```
 
+## Running as a Login Item (LaunchAgent)
+
+Running `watch.sh` as a macOS LaunchAgent starts the pipeline automatically at login and keeps it alive in the background. In this mode there's no terminal, so the meeting-confirmation step uses an `osascript` dialog instead, and success/error events surface as macOS notifications.
+
+### Full Disk Access
+
+The LaunchAgent runs under your user account but is not a normal app bundle, so Full Disk Access must be granted to `/bin/bash` (the binary that runs `watch.sh`):
+
+```
+System Settings → Privacy & Security → Full Disk Access → click + → /bin/bash
+```
+
+Alternatively grant it to the `watch.sh` script itself if macOS prompts for it.
+
+### Install
+
+1. Copy `.env.example` to `.env` and fill in your API key:
+   ```bash
+   cp .env.example .env
+   # edit .env — set ANTHROPIC_API_KEY=sk-ant-...
+   ```
+
+2. Run the install script:
+   ```bash
+   chmod +x setup-launchd.sh
+   ./setup-launchd.sh install
+   ```
+
+   This writes a plist to `~/Library/LaunchAgents/com.mstump.voice-memos-pipeline.plist` and loads it immediately — no reboot required.
+
+### Manage
+
+```bash
+./setup-launchd.sh status     # check if it's running
+./setup-launchd.sh uninstall  # stop and remove the plist
+```
+
+```bash
+# View live logs
+tail -f ~/Library/Logs/voice-memos-pipeline.log
+```
+
+### Uninstall
+
+```bash
+./setup-launchd.sh uninstall
+```
+
+### How headless mode differs from terminal mode
+
+| | Terminal | LaunchAgent (headless) |
+|---|---|---|
+| Meeting confirmation | Text prompt in terminal | `osascript` dialog box |
+| No transcript found | Prompts to paste manually | macOS notification, then skips |
+| Note saved | Prints path to stdout | macOS notification |
+
 ## Troubleshooting
 
 **Transcript not found** — Terminal needs Full Disk Access. Without it, `mdls` cannot read Voice Memos metadata. See Setup step 2.

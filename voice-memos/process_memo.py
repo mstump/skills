@@ -220,7 +220,56 @@ def find_meetings(file_time: datetime, config: dict) -> list[dict]:
 
 # ── User confirmation ─────────────────────────────────────────────────────────
 
+def _osascript(script: str) -> str:
+    result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    return result.stdout.strip()
+
+
+def notify(message: str, title: str = "Voice Memos Pipeline") -> None:
+    _osascript(f'display notification "{message}" with title "{title}"')
+
+
+def _confirm_meeting_gui(file_time: datetime, meetings: list[dict]) -> dict | None:
+    """Pick a meeting via osascript dialog — used when there's no TTY (LaunchAgent mode)."""
+    time_str = file_time.strftime("%Y-%m-%d %H:%M")
+
+    if not meetings:
+        result = _osascript(
+            f'display dialog "Voice Memo recorded at {time_str}\\n\\n'
+            f'No calendar events found nearby. Continue without meeting metadata?" '
+            f'buttons {{"Skip", "Continue"}} default button "Continue"'
+        )
+        if "Skip" in result or not result:
+            return None
+        return {"title": f"Recording {time_str}", "attendees": [], "start_time": "", "end_time": ""}
+
+    options = []
+    for m in meetings:
+        start = (m.get("start_time") or "")[:5]
+        options.append(f"{m.get('title', 'Untitled')} ({start})")
+    options.append("None of these / skip")
+
+    as_list = "{" + ", ".join(f'"{o}"' for o in options) + "}"
+    result = _osascript(
+        f'choose from list {as_list} '
+        f'with prompt "Voice Memo — {time_str}\\nWhich meeting does this belong to?" '
+        f'default items {{"{options[0]}"}}'
+    )
+
+    if not result or result == "false" or result == options[-1]:
+        return None
+
+    for i, opt in enumerate(options[:-1]):
+        if opt == result:
+            return meetings[i]
+
+    return None
+
+
 def confirm_meeting(memo_path: str, file_time: datetime, meetings: list[dict], transcript: str) -> dict | None:
+    if not sys.stdin.isatty():
+        return _confirm_meeting_gui(file_time, meetings)
+
     sep = "─" * 62
     print(f"\n{sep}")
     print(f"Memo:     {Path(memo_path).name}")
@@ -350,6 +399,12 @@ def main():
 
     if not transcript:
         print("not found.")
+        if not sys.stdin.isatty():
+            notify(
+                f"Could not extract transcript from {Path(memo_path).name}. "
+                "Check Full Disk Access for the process running this pipeline."
+            )
+            sys.exit(0)
         print(
             "\nCould not extract transcript automatically.\n"
             "Tip: grant Full Disk Access to Terminal in\n"
@@ -382,6 +437,8 @@ def main():
     output_dir = config.get("output_dir", "~/Documents")
     filepath = write_obsidian_note(output_dir, note_data, file_time, meeting, corrected)
     print(f"\nSaved: {filepath}\n")
+    if not sys.stdin.isatty():
+        notify(f"Note saved: {filepath.name}")
 
 
 if __name__ == "__main__":
